@@ -271,15 +271,20 @@ def send_email_notification(user_id, user_message, bot_reply, is_hot=False):
 # ============================================================
 # Welcome Flow 輔助函式
 # ============================================================
-def build_welcome_message():
-    """建立加好友歡迎訊息，附帶 Quick Reply 按鈕。"""
-    quick_reply = QuickReply(items=[
+def build_quick_reply():
+    """建立標準 5 按鈕 Quick Reply，供歡迎訊息與每次 AI 回覆共用。"""
+    return QuickReply(items=[
         QuickReplyItem(action=MessageAction(label="感情", text="感情")),
         QuickReplyItem(action=MessageAction(label="事業財運", text="事業財運")),
         QuickReplyItem(action=MessageAction(label="健康", text="健康")),
         QuickReplyItem(action=MessageAction(label="流年運勢", text="流年運勢")),
         QuickReplyItem(action=MessageAction(label="隨意聊聊", text="隨意聊聊")),
     ])
+
+
+def build_welcome_message():
+    """建立加好友歡迎訊息，附帶 Quick Reply 按鈕。"""
+    quick_reply = build_quick_reply()
     welcome_text = (
         "嗨！歡迎來到五木老師的命理諮詢 🌟\n\n"
         "我是小五，老師的 AI 助理～\n"
@@ -355,7 +360,7 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text)]
+                    messages=[TextMessage(text=reply_text, quick_reply=build_quick_reply())]
                 )
             )
         return
@@ -410,7 +415,7 @@ def handle_message(event):
         line_bot_api.reply_message_with_http_info(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)]
+                messages=[TextMessage(text=reply_text, quick_reply=build_quick_reply())]
             )
         )
 
