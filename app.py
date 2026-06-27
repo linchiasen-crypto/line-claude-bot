@@ -2,6 +2,7 @@ import os
 import smtplib
 import threading
 import logging
+import requests
 from datetime import datetime, timedelta
 from collections import defaultdict
 from email.mime.text import MIMEText
@@ -42,6 +43,10 @@ GMAIL_USER = os.environ.get('GMAIL_USER')
 GMAIL_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD')
 NOTIFY_EMAIL = os.environ.get('NOTIFY_EMAIL')
 PAYMENT_INFO = os.environ.get('PAYMENT_INFO', '匯款資訊請洽老師本人安排')
+
+IG_PAGE_ACCESS_TOKEN = os.environ.get('IG_PAGE_ACCESS_TOKEN')
+IG_VERIFY_TOKEN = os.environ.get('IG_VERIFY_TOKEN', 'wumu_ig_verify_2026')
+IG_ACCOUNT_ID = os.environ.get('IG_ACCOUNT_ID')
 
 
 # ============================================================
@@ -529,6 +534,99 @@ def handle_message(event):
                 messages=[TextMessage(text=reply_text, quick_reply=build_quick_reply())]
             )
         )
+
+
+# ============================================================
+# Instagram 私訊：回覆函式
+# ============================================================
+def send_ig_reply(recipient_id, text):
+    """透過 Meta Graph API 回覆 IG 私訊。"""
+    url = f"https://graph.facebook.com/v21.0/{IG_ACCOUNT_ID}/messages"
+    payload = {
+        "recipient": {"id": recipient_id},
+        "message": {"text": text}
+    }
+    params = {"access_token": IG_PAGE_ACCESS_TOKEN}
+    resp = requests.post(url, params=params, json=payload, timeout=10)
+    if not resp.ok:
+        logger.error(f"[IG] 回覆失敗: {resp.status_code} {resp.text}")
+    return resp
+
+
+# ============================================================
+# Instagram Webhook 路由
+# ============================================================
+@app.route("/ig-webhook", methods=['GET', 'POST'])
+def ig_webhook():
+    """Meta 平台呼叫的 IG 訊息入口。"""
+    # --- GET：Meta 驗證 webhook ---
+    if request.method == 'GET':
+        mode = request.args.get('hub.mode')
+        token = request.args.get('hub.verify_token')
+        challenge = request.args.get('hub.challenge')
+        if mode == 'subscribe' and token == IG_VERIFY_TOKEN:
+            logger.info("✅ IG Webhook 驗證成功")
+            return challenge, 200
+        logger.warning(f"❌ IG Webhook 驗證失敗 (token={token})")
+        return 'Forbidden', 403
+
+    # --- POST：接收訊息事件 ---
+    data = request.get_json(silent=True) or {}
+    if data.get('object') != 'instagram':
+        return 'OK', 200
+
+    for entry in data.get('entry', []):
+        for messaging in entry.get('messaging', []):
+            sender_id = messaging.get('sender', {}).get('id')
+            message = messaging.get('message', {})
+
+            # 跳過 bot 自己送出的 echo 訊息
+            if message.get('is_echo'):
+                continue
+
+            user_message = message.get('text', '').strip()
+            if not user_message or not sender_id:
+                continue
+
+            # IG 用戶 ID 加前綴，與 LINE 用戶分開
+            user_id = f"ig_{sender_id}"
+            logger.info(f"📩 [IG] 收到 [{user_id[:14]}...]: {user_message}")
+
+            get_user_history(user_id)
+            append_to_history(user_id, "user", user_message)
+
+            messages_for_claude = [
+                {"role": m["role"], "content": m["content"]}
+                for m in conversation_memory[user_id]
+            ]
+
+            try:
+                response = claude_client.messages.create(
+                    model="claude-haiku-4-5",
+                    max_tokens=1024,
+                    system=SYSTEM_PROMPT,
+                    messages=messages_for_claude
+                )
+                reply_text = response.content[0].text
+            except Exception as e:
+                reply_text = "抱歉，系統暫時有點忙，請稍等一下或留下您的稱呼，老師會親自回覆您 🙏"
+                logger.error(f"[IG] Claude API 錯誤: {e}")
+
+            append_to_history(user_id, "assistant", reply_text)
+
+            is_hot = is_hot_lead(user_message, reply_text)
+            if is_hot:
+                logger.info(f"🔥 [IG] 熱客戶識別! [{user_id[:14]}...]")
+                threading.Thread(
+                    target=send_email_notification,
+                    args=(user_id, user_message, reply_text, True),
+                    daemon=True
+                ).start()
+
+            send_ig_reply(sender_id, reply_text)
+            logger.info(f"💬 [IG] 回覆 [{user_id[:14]}...]: {reply_text[:60]}...")
+
+    return 'OK', 200
 
 
 # ============================================================
