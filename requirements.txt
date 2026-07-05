@@ -3,3 +3,5 @@ line-bot-sdk>=3.0.0
 anthropic
 gunicorn
 requests
+gspread>=6.0.0
+google-auth>=2.0.0

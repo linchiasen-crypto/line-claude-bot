@@ -1,4 +1,5 @@
 import os
+import json
 import smtplib
 import threading
 import logging
@@ -6,6 +7,9 @@ import requests
 from datetime import datetime, timedelta
 from collections import defaultdict
 from email.mime.text import MIMEText
+
+import gspread
+from google.oauth2.service_account import Credentials
 
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -45,6 +49,99 @@ NOTIFY_EMAIL = os.environ.get('NOTIFY_EMAIL')
 PAYMENT_INFO = os.environ.get('PAYMENT_INFO', '匯款資訊請洽老師本人安排')
 
 IG_PAGE_ACCESS_TOKEN = os.environ.get('IG_PAGE_ACCESS_TOKEN')
+
+# ============================================================
+# Google Sheet 設定（WF-1 入庫 + 對話情報落地）
+# ============================================================
+# Render 環境變數：GSHEET_LEADS_ID = Google Sheet ID（URL 中的長字串）
+# Render 環境變數：GOOGLE_SERVICE_ACCOUNT_JSON = 服務帳號 JSON 內容（整份貼進去）
+GSHEET_LEADS_ID = os.environ.get('GSHEET_LEADS_ID', '')
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
+
+_gsheet_client = None   # 快取，避免每次請求都重建連線
+
+
+def _get_gsheet_client():
+    """取得（或重建）gspread 客戶端。失敗回傳 None，不中斷主流程。"""
+    global _gsheet_client
+    if _gsheet_client is not None:
+        return _gsheet_client
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GSHEET_LEADS_ID:
+        return None
+    try:
+        creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        scopes = [
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive.readonly',
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        _gsheet_client = gspread.authorize(creds)
+        logger.info("✅ Google Sheet 連線成功")
+        return _gsheet_client
+    except Exception as e:
+        logger.error(f"Google Sheet 初始化失敗: {e}")
+        return None
+
+
+def _get_worksheet(sheet_name: str):
+    """取得指定工作表，找不到時回傳第一張。"""
+    gc = _get_gsheet_client()
+    if not gc:
+        return None
+    try:
+        sh = gc.open_by_key(GSHEET_LEADS_ID)
+        try:
+            return sh.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            logger.warning(f"工作表 '{sheet_name}' 不存在，改用第一張")
+            return sh.sheet1
+    except Exception as e:
+        logger.error(f"開啟 Google Sheet 失敗: {e}")
+        return None
+
+
+def log_new_follower(user_id: str, source: str = "LINE_OA"):
+    """
+    WF-1：新好友加入時寫入『LINE好友清單』工作表。
+    欄位：LINE_UserID | 姓名 | 加入日期 | 來源 | 狀態 | Day3已發 | Day7已發 | Day14已發 | 備註
+    """
+    ws = _get_worksheet("LINE好友清單")
+    if not ws:
+        logger.warning("GSheet 未設定，跳過新好友入庫")
+        return
+    try:
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        row = [user_id, "", now, source, "新加入", "否", "否", "否", ""]
+        ws.append_row(row, value_input_option='USER_ENTERED')
+        logger.info(f"✅ 新好友入庫: {user_id[:8]}...")
+    except Exception as e:
+        logger.error(f"新好友入庫失敗: {e}")
+
+
+def update_lead_status(user_id: str, status: str, note: str = ""):
+    """
+    對話情報落地：根據熱/溫/冷更新潛在客戶狀態與備註。
+    狀態選項：新加入 / 培育中 / 熱客戶 / 已諮詢 / 已成交 / 已封鎖
+    """
+    ws = _get_worksheet("LINE好友清單")
+    if not ws:
+        return
+    try:
+        cell = ws.find(user_id, in_column=1)
+        if not cell:
+            logger.info(f"找不到用戶 {user_id[:8]}...，建立新列再更新")
+            ws.append_row([user_id, "", datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                           "LINE_OA", status, "否", "否", "否", note],
+                          value_input_option='USER_ENTERED')
+            return
+        ws.update_cell(cell.row, 5, status)   # 第 5 欄 = 狀態
+        if note:
+            existing_note = ws.cell(cell.row, 9).value or ""
+            new_note = f"[{datetime.now().strftime('%m/%d %H:%M')}] {note[:80]}"
+            ws.update_cell(cell.row, 9, f"{existing_note}\n{new_note}".strip())
+        logger.info(f"✅ 用戶狀態更新: {user_id[:8]}... → {status}")
+    except Exception as e:
+        logger.error(f"GSheet 狀態更新失敗: {e}")
 IG_VERIFY_TOKEN = os.environ.get('IG_VERIFY_TOKEN', 'wumu_ig_verify_2026')
 IG_ACCOUNT_ID = os.environ.get('IG_ACCOUNT_ID')
 
@@ -515,6 +612,7 @@ def handle_follow(event):
     user_id = event.source.user_id if event.source.user_id else "anonymous"
     logger.info(f"🎉 新好友加入: [{user_id[:8]}...]")
 
+    # 發送歡迎訊息
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message_with_http_info(
@@ -523,6 +621,13 @@ def handle_follow(event):
                 messages=[build_welcome_message()]
             )
         )
+
+    # WF-1：背景寫入 Google Sheet（不阻塞 LINE webhook 回應）
+    threading.Thread(
+        target=log_new_follower,
+        args=(user_id, "LINE_OA"),
+        daemon=True
+    ).start()
 
 
 # ============================================================
@@ -585,12 +690,16 @@ def handle_message(event):
     if is_hot:
         logger.info(f"🔥 熱客戶識別! [{user_id[:8]}...]")
 
-    # 7. 背景寄送 email(目前只在熱客戶時通知,避免信箱被淹沒)
-    #    如果想要每次對話都通知,把 if is_hot 那行刪掉即可
+    # 7. 熱客戶：Email 通知 + GSheet 狀態更新（並行，不阻塞）
     if is_hot:
         threading.Thread(
             target=send_email_notification,
             args=(user_id, user_message, reply_text, True),
+            daemon=True
+        ).start()
+        threading.Thread(
+            target=update_lead_status,
+            args=(user_id, "熱客戶", user_message),
             daemon=True
         ).start()
 
