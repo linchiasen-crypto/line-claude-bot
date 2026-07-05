@@ -96,7 +96,7 @@ def _get_worksheet(sheet_name: str):
             logger.warning(f"工作表 '{sheet_name}' 不存在，改用第一張")
             return sh.sheet1
     except Exception as e:
-        logger.error(f"開啟 Google Sheet 失敗: {e}")
+        logger.error(f"開啟 Google Sheet 失敗: {repr(e)}")
         return None
 
 
