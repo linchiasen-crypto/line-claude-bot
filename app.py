@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import random
 import smtplib
 import threading
@@ -143,6 +144,192 @@ def update_lead_status(user_id: str, status: str, note: str = ""):
         logger.info(f"✅ 用戶狀態更新: {user_id[:8]}... → {status}")
     except Exception as e:
         logger.error(f"GSheet 狀態更新失敗: {e}")
+
+
+# ============================================================
+# B：對話情報落地（學習迴圈 Layer 1）
+# ============================================================
+# 對話閒置滿 N 分鐘 → Haiku 摘要（意圖/溫度/卡點/金句）→ 寫入『對話情報』分頁。
+_intel_pending = set()          # 有新活動、尚未摘要的 user_id
+INTEL_IDLE_MINUTES = 30         # 閒置多久算一段對話結束
+
+def summarize_conversation(user_id):
+    """呼叫 Haiku 把一段對話結構化摘要，回傳 dict 或 None。"""
+    msgs = conversation_memory.get(user_id, [])
+    if len(msgs) < 2:
+        return None
+    transcript = "\n".join(
+        f"{'客戶' if m['role'] == 'user' else '小五'}：{m['content']}" for m in msgs)
+    prompt = (
+        "你是命理客服的對話分析員。讀完以下客服對話，只輸出一段 JSON（不要多餘文字），欄位：\n"
+        '{"意圖":"問價/感情/事業/財運/健康/流年/純聊 擇一",'
+        '"溫度":"熱/溫/冷 擇一（熱=明確問價或問檔期）",'
+        '"卡點":"客戶的疑慮或異議，沒有填無",'
+        '"成交跡象":"有/無",'
+        '"金句":"客戶最反映心聲的一句原話",'
+        '"摘要":"20字內重點"}\n\n對話：\n' + transcript
+    )
+    try:
+        resp = claude_client.messages.create(
+            model="claude-haiku-4-5", max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text.strip()
+        text = text[text.find("{"): text.rfind("}") + 1]
+        return json.loads(text)
+    except Exception as e:
+        logger.error(f"對話摘要失敗: {e}")
+        return None
+
+def log_conversation_intel(user_id, data):
+    """把摘要寫入『對話情報』分頁。"""
+    ws = _get_worksheet("對話情報")
+    if not ws:
+        return
+    try:
+        row = [
+            datetime.now().strftime('%Y-%m-%d %H:%M'), user_id,
+            data.get("意圖", ""), data.get("溫度", ""),
+            data.get("卡點", ""), data.get("成交跡象", ""),
+            data.get("金句", ""), data.get("摘要", ""),
+        ]
+        ws.append_row(row, value_input_option='USER_ENTERED')
+        logger.info(f"✅ 對話情報落地: {user_id[:8]}... 溫度={data.get('溫度')}")
+    except Exception as e:
+        logger.error(f"對話情報寫入失敗: {e}")
+
+def run_conversation_intel():
+    """掃描閒置對話，摘要落地。由背景排程呼叫。"""
+    now = datetime.now()
+    for user_id in list(_intel_pending):
+        msgs = conversation_memory.get(user_id, [])
+        if not msgs:
+            _intel_pending.discard(user_id)
+            continue
+        idle_min = (now - msgs[-1]["time"]).total_seconds() / 60
+        if idle_min >= INTEL_IDLE_MINUTES:
+            data = summarize_conversation(user_id)
+            if data:
+                log_conversation_intel(user_id, data)
+                if data.get("溫度") == "熱":
+                    update_lead_status(user_id, "熱客戶", data.get("摘要", ""))
+            _intel_pending.discard(user_id)
+
+
+# ============================================================
+# WF-3：年度回購觸發器（每日掃客戶主檔 → Email 通知老師確認）
+# ============================================================
+# 『客戶主檔』分頁欄位（第一列須為表頭）：
+#   稱呼 | LINE_UserID | 生日(YYYY-MM-DD或MM-DD) | 上次服務日(YYYY-MM-DD) | 上次服務項目 | 金額 | 備註
+def _parse_md(s):
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m-%d", "%m/%d"):
+        try:
+            d = datetime.strptime(s, fmt)
+            return (d.month, d.day)
+        except ValueError:
+            continue
+    return None
+
+def _parse_date(s):
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+def _days_until(month, day, today):
+    """距下一個 (月,日) 還有幾天（跨年處理）。"""
+    try:
+        nxt = datetime(today.year, month, day)
+    except ValueError:
+        return None
+    if nxt.date() < today.date():
+        nxt = datetime(today.year + 1, month, day)
+    return (nxt.date() - today.date()).days
+
+def notify_teacher_repurchase(hits):
+    if not (GMAIL_USER and GMAIL_PASSWORD and NOTIFY_EMAIL):
+        return
+    try:
+        body = ("以下客戶進入回購時機，請老師確認是否主動聯繫：\n\n"
+                + "\n".join(hits)
+                + "\n\n（WF-3 年度回購觸發器自動掃描，僅提醒，未自動聯繫客戶）")
+        msg = MIMEText(body, 'plain', 'utf-8')
+        msg['Subject'] = f"🔔 回購提醒 {datetime.now().strftime('%m/%d')}：{len(hits)} 位客戶到期"
+        msg['From'] = GMAIL_USER
+        msg['To'] = NOTIFY_EMAIL
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(GMAIL_USER, GMAIL_PASSWORD)
+            server.send_message(msg)
+        logger.info("WF-3 回購提醒 Email 已寄出")
+    except Exception as e:
+        logger.error(f"WF-3 Email 失敗: {e}")
+
+def scan_repurchase_triggers():
+    """掃客戶主檔，找出符合三種回購時機者，Email 通知老師。"""
+    ws = _get_worksheet("客戶主檔")
+    if not ws:
+        logger.info("WF-3：客戶主檔未建立，跳過")
+        return
+    try:
+        rows = ws.get_all_records()
+    except Exception as e:
+        logger.error(f"WF-3 讀取客戶主檔失敗: {e}")
+        return
+    today = datetime.now()
+    lichun = _days_until(2, 4, today)   # 立春約 2/4
+    hits = []
+    for r in rows:
+        name = str(r.get("稱呼") or r.get("姓名") or "").strip()
+        if not name:
+            continue
+        reasons = []
+        md = _parse_md(str(r.get("生日") or "").strip())
+        if md:
+            d = _days_until(md[0], md[1], today)
+            if d is not None and 0 <= d <= 14:
+                reasons.append(f"生日剩{d}天")
+        last = _parse_date(str(r.get("上次服務日") or "").strip())
+        if last:
+            gap = (today.date() - last.date()).days
+            if gap >= 335:
+                reasons.append(f"上次服務已{gap}天")
+        if lichun is not None and 0 <= lichun <= 60:
+            reasons.append(f"立春剩{lichun}天(流年季)")
+        if reasons:
+            hits.append(f"・{name}（{r.get('上次服務項目', '')}）→ {'、'.join(reasons)}")
+    if hits:
+        notify_teacher_repurchase(hits)
+    logger.info(f"WF-3 掃描完成，命中 {len(hits)} 人")
+
+
+# ============================================================
+# 背景排程：B 對話情報（每 10 分）＋ WF-3 回購掃描（每日一次，09 時後）
+# ============================================================
+# ⚠️ 假設 Render 單一 worker；多 worker 會重複寄信。Render 需保持不休眠。
+_last_daily_run = None
+
+def background_worker():
+    global _last_daily_run
+    while True:
+        try:
+            run_conversation_intel()
+            now = datetime.now()
+            if _last_daily_run != now.date() and now.hour >= 9:
+                scan_repurchase_triggers()
+                _last_daily_run = now.date()
+        except Exception as e:
+            logger.error(f"背景排程錯誤: {e}")
+        time.sleep(600)
+
+def start_background_worker():
+    if os.environ.get("RUN_SCHEDULER", "1") != "1":
+        return
+    threading.Thread(target=background_worker, daemon=True).start()
+    logger.info("🕒 背景排程啟動（對話情報 + WF-3 回購）")
+
+
 IG_VERIFY_TOKEN = os.environ.get('IG_VERIFY_TOKEN', 'wumu_ig_verify_2026')
 IG_ACCOUNT_ID = os.environ.get('IG_ACCOUNT_ID')
 
@@ -309,7 +496,9 @@ SYSTEM_PROMPT = """你是「五木老師」紫微斗數命理品牌的智能客�
    ➜ 適合:迷惘整體人生方向、想了解自己天賦與弱點
 
 2. 選車牌 / 選手機號碼 NT$ 3,000
+   - 選車牌含加值:除了幫您挑出最適合的號碼,還會幫您算「交車吉日」,這部分不另外收費
    ➜ 適合:剛買車、換號碼、想轉運
+   ➜ 對話時可主動點出「交車吉日免費幫您算」當加值亮點,但不要浮誇
 
 3. 奇門遁甲招財改運
    - 年盤 NT$ 8,800
@@ -542,6 +731,9 @@ def append_to_history(user_id, role, content):
     max_messages = MEMORY_TURNS * 2  # user + assistant 各算一則
     if len(conversation_memory[user_id]) > max_messages:
         conversation_memory[user_id] = conversation_memory[user_id][-max_messages:]
+
+    if role == "user":
+        _intel_pending.add(user_id)   # B：標記此對話有新活動，待閒置後摘要
 
 
 # ============================================================
@@ -851,6 +1043,9 @@ def ig_webhook():
 # ============================================================
 # 啟動入口
 # ============================================================
+# 模組載入即啟動背景排程（gunicorn 不會執行 __main__，故放這裡）
+start_background_worker()
+
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8080))
     logger.info(f"🌟 五木老師客服啟動於 port {port}")
