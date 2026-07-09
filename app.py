@@ -298,7 +298,8 @@ def scan_repurchase_triggers():
         if lichun is not None and 0 <= lichun <= 60:
             reasons.append(f"立春剩{lichun}天(流年季)")
         if reasons:
-            hits.append(f"・{name}（{r.get('上次服務項目', '')}）→ {'、'.join(reasons)}")
+            svc = r.get('服務項目') or r.get('上次服務項目') or ''
+            hits.append(f"・{name}（{svc}）→ {'、'.join(reasons)}")
     if hits:
         notify_teacher_repurchase(hits)
     logger.info(f"WF-3 掃描完成，命中 {len(hits)} 人")
