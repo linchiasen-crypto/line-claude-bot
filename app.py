@@ -705,6 +705,15 @@ SYSTEM_PROMPT += f"""
 {PAYMENT_INFO}
 """
 
+SYSTEM_PROMPT += """
+═══════════════════════════════
+【防捏造護欄（最高優先，違反視為嚴重錯誤）】
+═══════════════════════════════
+- 除非客戶在最近對話裡「已經實際提供預約資料」（生辰、稱呼）或「明確說要下單／幫我安排」，否則絕對禁止說出：「收到了」「幫您登記」「幫您排隊」「已幫您安排」「匯款」「付款確認」這類已成交語氣。沒成交卻說成交，會讓客戶以為被詐騙，是最嚴重的錯誤。
+- 遇到看不懂、太短、或只有一兩個字／一個數字／貼圖的訊息，不要腦補成下單確認，也不要硬收單——先用一句話禮貌確認對方的意思（例：「想先確認一下，您是想了解哪方面呢？」）。
+- 「測驗」「小測」等互動字眼由系統另外處理，不屬於預約流程；萬一你收到這類訊息，只需親切回應、不要導向付款。
+"""
+
 
 # ============================================================
 # 對話記憶輔助函式
@@ -787,6 +796,73 @@ def send_email_notification(user_id, user_message, bot_reply, is_hot=False):
 # ============================================================
 # Welcome Flow 輔助函式
 # ============================================================
+# ============================================================
+# 60 秒易經財運小測（確定性流程，不經 AI）
+# ============================================================
+QUIZ_TRIGGERS = {
+    "測驗", "小測", "測驗！", "紫微小測", "財運測驗", "財運小測",
+    "60秒小測", "60 秒小測", "測驗開始", "開始測驗", "我要測驗",
+}
+
+QUIZ_INTRO = (
+    "來玩囉～這是五木老師的 60 秒財運直覺小測 ✨\n\n"
+    "先深呼吸，別想太多——\n"
+    "下面四個數字，直覺選一個，直接回覆給我：\n\n"
+    "453　980　537　787"
+)
+
+_QUIZ_TAIL = (
+    "\n\n這只是 60 秒的直覺速覽，看個大方向就好。\n"
+    "想知道你完整命盤的財運怎麼走、哪幾個月是關鍵，"
+    "跟小林說一聲，幫你安排老師 🙂"
+)
+
+QUIZ_READINGS = {
+    "453": (
+        "453 → 困卦 ☵（回春型財運）\n\n"
+        "困卦，水困於澤中，困而不失其所。\n\n"
+        "下半年財運像長跑的第二春——前段耗力，中段蓄積，後段爆發。\n\n"
+        "適合：重啟停擺的計畫、回頭看被擱置的機會，時機到一推即發。\n\n"
+        "提醒：困境不是終點，是轉機前的醞釀期。\n\n"
+        "【困中生機，後發先至】" + _QUIZ_TAIL
+    ),
+    "980": (
+        "980 → 泰卦 ☷（豐盛型財運）\n\n"
+        "泰卦，天地相交，氣場暢通無阻。\n\n"
+        "980 落在泰卦，下半年財氣旺盛——正財偏財都有機會，貴人也比平時多。\n\n"
+        "適合：大膽出手、擴大佈局、把之前猶豫的合作或投資付諸行動。\n\n"
+        "提醒：泰極生否，旺的時候同步守成，不要散財。\n\n"
+        "【天地交泰，財氣暢通】" + _QUIZ_TAIL
+    ),
+    "537": (
+        "537 → 謙卦 ☶（積累型財運）\n\n"
+        "謙卦，山藏地中，滿招損謙受益。\n\n"
+        "537 不走表面風光路線——低調中積累，厚積薄發是這一型的節奏。\n\n"
+        "適合：鞏固本業、累積口碑、耕耘長期客戶關係，不急著出風頭。\n\n"
+        "提醒：謙不是軟弱，是厚積薄發的底氣。\n\n"
+        "【低調積累，厚積薄發】" + _QUIZ_TAIL
+    ),
+    "787": (
+        "787 → 鼎卦 ☲（轉化型財運）\n\n"
+        "鼎卦，革故鼎新，以舊換新。\n\n"
+        "787 的財運關鍵字是「轉」——轉型、轉換跑道、把技能轉成實際收入。\n\n"
+        "適合：斜槓發展、把興趣變現、開創第二收入，不要只靠一條路。\n\n"
+        "提醒：鼎需要火候，急不得，也不能一直溫吞。\n\n"
+        "【革故鼎新，開創新局】" + _QUIZ_TAIL
+    ),
+}
+
+
+def build_quiz_quick_reply():
+    """測驗選數字用的快速回覆按鈕。"""
+    return QuickReply(items=[
+        QuickReplyItem(action=MessageAction(label="453", text="453")),
+        QuickReplyItem(action=MessageAction(label="980", text="980")),
+        QuickReplyItem(action=MessageAction(label="537", text="537")),
+        QuickReplyItem(action=MessageAction(label="787", text="787")),
+    ])
+
+
 def build_quick_reply():
     """建立標準 5 按鈕 Quick Reply，供歡迎訊息與每次 AI 回覆共用。"""
     return QuickReply(items=[
@@ -879,6 +955,37 @@ def handle_message(event):
         append_to_history(user_id, "user", user_message)
         append_to_history(user_id, "assistant", reply_text)
         logger.info(f"💬 Quick Reply [{user_id[:8]}...]: {user_message}")
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text, quick_reply=build_quick_reply())]
+                )
+            )
+        return
+
+    # 測驗攔截：60 秒易經財運小測（確定性流程，不經 AI）
+    quiz_key = user_message.strip().rstrip("！!。.～~ ")
+    if quiz_key in QUIZ_TRIGGERS:
+        append_to_history(user_id, "user", user_message)
+        append_to_history(user_id, "assistant", QUIZ_INTRO)
+        logger.info(f"🎲 測驗開始 [{user_id[:8]}...]")
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=QUIZ_INTRO, quick_reply=build_quiz_quick_reply())]
+                )
+            )
+        return
+
+    if quiz_key in QUIZ_READINGS:
+        reply_text = QUIZ_READINGS[quiz_key]
+        append_to_history(user_id, "user", user_message)
+        append_to_history(user_id, "assistant", reply_text)
+        logger.info(f"🎲 測驗結果 {quiz_key} [{user_id[:8]}...]")
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message_with_http_info(
