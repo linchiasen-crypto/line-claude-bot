@@ -422,7 +422,7 @@ SYSTEM_PROMPT = """你是「五木老師」紫微斗數命理品牌的智能客�
 - 鐵則:80% 的時間讓客戶說,你只說 20%
 
 ═══════════════════════════════
-【去機器人味：四條鐵則（最高優先，違反即重寫）】
+【去機器人味：五條鐵則（最高優先，違反即重寫）】
 ═══════════════════════════════
 客戶最反感的就是「一看就知道是機器人」。以下四條凌駕一切格式：
 
@@ -431,6 +431,7 @@ SYSTEM_PROMPT = """你是「五木老師」紫微斗數命理品牌的智能客�
 2. **破除罐頭三段式**:不要每則都「問候→條列→制式結尾」。拿掉「您好~感謝私訊」這種開場、拿掉「期待為您服務」這種結尾,直接回應對方剛剛講的內容。
 3. **一次只講一件事**:用短句、像真人在打字。不要一次丟一大段、不要一次問三個問題。
 4. **鏡像對方的話**:用客戶自己的用詞回應（他說「很迷惘」就接「這種迷惘…」,不要翻譯成客服術語）。開場語每次都要不一樣,不要被看出是同一套模板。
+5. 純文字輸出:回覆一律純文字,禁止使用任何 markdown 符號——不要打 * 或 ** 或 *** 來強調、不要 # 標題、不要 ` 反引號、不要用 * 當清單符號。LINE 不會把這些變成粗體,只會原封不動顯示星號,看起來像亂碼。要強調就靠遣詞或全形標點,不要靠符號。
 
 ═══════════════════════════════
 【對話核心原則：先聽後說】
@@ -747,6 +748,25 @@ def append_to_history(user_id, role, content):
 
 
 # ============================================================
+# 純文字化：移除 markdown 符號（LINE / IG 不會渲染 markdown）
+# ============================================================
+def strip_markdown(text):
+    """把 AI 回覆裡的 markdown 星號等符號清掉，避免 LINE/IG 直接顯示 ** * # ` 這些符號。"""
+    if not text:
+        return text
+    import re
+    # 粗體/斜體：***x*** **x** *x* → 只留內文
+    text = re.sub(r'\*{1,3}([^*\n]+?)\*{1,3}', r'\1', text)
+    # 行首標題符號 #（避免誤刪句中井字，只處理行首）
+    text = re.sub(r'(?m)^\s{0,3}#{1,6}\s+', '', text)
+    # 行首清單星號 "* " → 全形頓號
+    text = re.sub(r'(?m)^(\s*)\*\s+', r'\1・', text)
+    # 殘留的星號與反引號一律清掉（不動底線，避免誤傷 email/ID）
+    text = text.replace('*', '').replace('`', '')
+    return text
+
+
+# ============================================================
 # 熱客戶判斷
 # ============================================================
 def is_hot_lead(user_message, ai_reply):
@@ -1016,7 +1036,7 @@ def handle_message(event):
             system=SYSTEM_PROMPT,
             messages=messages_for_claude
         )
-        reply_text = response.content[0].text
+        reply_text = strip_markdown(response.content[0].text)
     except Exception as e:
         reply_text = "抱歉,系統暫時有點忙,請稍等一下或留下您的稱呼,老師會親自回覆您 🙏"
         logger.error(f"Claude API 錯誤: {e}")
@@ -1126,7 +1146,7 @@ def ig_webhook():
                     system=SYSTEM_PROMPT,
                     messages=messages_for_claude
                 )
-                reply_text = response.content[0].text
+                reply_text = strip_markdown(response.content[0].text)
             except Exception as e:
                 reply_text = "抱歉，系統暫時有點忙，請稍等一下或留下您的稱呼，老師會親自回覆您 🙏"
                 logger.error(f"[IG] Claude API 錯誤: {e}")
