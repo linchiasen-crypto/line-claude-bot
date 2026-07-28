@@ -13,7 +13,7 @@ from email.mime.text import MIMEText
 import gspread
 from google.oauth2.service_account import Credentials
 
-from flask import Flask, request, abort
+from flask import Flask, request, abort, session, redirect, Response
 from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import (
     Configuration,
@@ -40,6 +40,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.secret_key = os.environ.get('FLASK_SECRET_KEY') or os.urandom(24)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=True)
 
 configuration = Configuration(access_token=os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
@@ -55,10 +57,12 @@ IG_PAGE_ACCESS_TOKEN = os.environ.get('IG_PAGE_ACCESS_TOKEN')
 # LINE 原始 access token（loading「輸入中」動畫 API 用）
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 
-# 人工接手：老師個人 LINE userId（逗號分隔）可下指令暫停/恢復對某客戶的 AI 自動回覆
+# 人工接手（Human Handoff）：/admin 網頁控制台 + LINE 指令雙軌，暫停某客戶的 AI 自動回覆
 ADMIN_USER_IDS = {u.strip() for u in os.environ.get('ADMIN_USER_IDS', '').split(',') if u.strip()}
-HANDOFF_COL = 11            # Google Sheet K 欄 = 人工接手（是/空）
-manual_takeover = set()     # 目前由真人接手、AI 暫停的 user_id
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '')   # /admin 管理網頁登入密碼
+HANDOFF_COL = 11            # Google Sheet K 欄 = 人工接手（存自動恢復時間字串）
+HANDOFF_HOURS = 2          # 暫停後自動恢復 AI 的時數
+handoff_until = {}          # {user_id: datetime}，AI 暫停到此時間，之後自動恢復
 _handoffs_loaded = False    # 是否已從 Sheet 載入接手名單
 
 # ============================================================
@@ -192,7 +196,7 @@ def clear_game_state(user_id: str):
 # 人工接手（Human Handoff）：K 欄旗標讀寫 + 客戶解析
 # ------------------------------------------------------------
 def load_handoffs():
-    """從 Sheet K 欄載入目前『人工接手中』的 user_id（首次訊息時跑一次）。"""
+    """從 Sheet K 欄載入未過期的人工接手（K 存自動恢復時間）。首次訊息時跑一次。"""
     global _handoffs_loaded
     _handoffs_loaded = True
     ws = _get_worksheet("LINE好友清單")
@@ -201,31 +205,60 @@ def load_handoffs():
     try:
         flags = ws.col_values(HANDOFF_COL)   # 含標題列
         ids = ws.col_values(1)
+        now = datetime.now()
         for i, v in enumerate(flags):
-            if i == 0:
+            if i == 0 or i >= len(ids):
                 continue
-            if str(v).strip() == "是" and i < len(ids) and str(ids[i]).strip():
-                manual_takeover.add(str(ids[i]).strip())
-        logger.info(f"🙋 載入人工接手名單 {len(manual_takeover)} 人")
+            uid = str(ids[i]).strip()
+            ts = str(v).strip()
+            if not uid or not ts:
+                continue
+            try:
+                until = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if until > now:
+                handoff_until[uid] = until
+        logger.info(f"🙋 載入人工接手 {len(handoff_until)} 人")
     except Exception as e:
         logger.error(f"載入接手名單失敗: {e}")
 
 
-def set_handoff(user_id: str, on: bool):
-    """設定/解除某客戶的人工接手旗標（in-memory + Sheet K 欄）。"""
-    if on:
-        manual_takeover.add(user_id)
-    else:
-        manual_takeover.discard(user_id)
+def _write_handoff_cell(user_id: str, value: str):
+    """把 K 欄寫成 value（背景執行，不阻塞請求）。"""
     ws = _get_worksheet("LINE好友清單")
     if not ws:
         return
     try:
         cell = ws.find(user_id, in_column=1)
         if cell:
-            ws.update_cell(cell.row, HANDOFF_COL, "是" if on else "")
+            ws.update_cell(cell.row, HANDOFF_COL, value)
     except Exception as e:
         logger.error(f"接手旗標寫入失敗: {e}")
+
+
+def set_handoff(user_id: str, on: bool):
+    """暫停（on=True，HANDOFF_HOURS 小時後自動恢復）或立即恢復（on=False）某客戶的 AI。"""
+    if on:
+        until = datetime.now() + timedelta(hours=HANDOFF_HOURS)
+        handoff_until[user_id] = until
+        val = until.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        handoff_until.pop(user_id, None)
+        val = ""
+    threading.Thread(target=_write_handoff_cell, args=(user_id, val), daemon=True).start()
+
+
+def is_paused(user_id: str) -> bool:
+    """該客戶目前是否人工接手中；已過期則自動恢復（清旗標）。"""
+    until = handoff_until.get(user_id)
+    if not until:
+        return False
+    if datetime.now() < until:
+        return True
+    handoff_until.pop(user_id, None)
+    threading.Thread(target=_write_handoff_cell, args=(user_id, ""), daemon=True).start()
+    return False
 
 
 def resolve_customer(token: str):
@@ -1166,6 +1199,133 @@ def webhook():
 
 
 # ============================================================
+# /admin 人工接手控制台（密碼登入）
+# ============================================================
+def _esc(s):
+    return (str(s) if s is not None else '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+
+def _admin_logged_in():
+    return session.get('admin') is True
+
+
+LOGIN_HTML = """<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>五木老師客服控制台</title>
+<style>body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f0e8d0;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}
+.card{background:#fff;padding:32px 28px;border-radius:14px;box-shadow:0 6px 24px rgba(0,0,0,.12);width:min(92vw,340px)}
+h1{font-size:19px;margin:0 0 4px;color:#2b2b2b;letter-spacing:1px}p{color:#999;font-size:13px;margin:0 0 20px}
+input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #ccc;border-radius:8px;font-size:16px;margin-bottom:12px}
+button{width:100%;padding:12px;border:0;border-radius:8px;background:#8c1c1c;color:#fff;font-size:16px;font-weight:700;cursor:pointer}
+.err{color:#8c1c1c;font-size:13px;margin-bottom:10px}</style>
+<div class=card><h1>五木老師 · 客服控制台</h1><p>人工接手管理</p>
+__ERR__
+<form method=post action="/admin/login">
+<input type=password name=password placeholder="登入密碼" autofocus>
+<button type=submit>登入</button></form></div>"""
+
+
+PANEL_HTML = """<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>五木老師客服控制台</title>
+<style>*{box-sizing:border-box}
+body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f0e8d0;margin:0;color:#2b2b2b}
+header{background:#1a1f3a;color:#c9a84c;padding:15px 18px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0}
+header h1{font-size:16px;margin:0;letter-spacing:2px}
+header button{background:none;border:1px solid #c9a84c;color:#c9a84c;padding:6px 12px;border-radius:6px;font-size:13px;cursor:pointer}
+.wrap{max-width:560px;margin:0 auto;padding:16px}
+.count{color:#888;font-size:13px;margin:2px 2px 14px}
+.row{background:#fff;border-radius:12px;padding:14px 16px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:12px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+.name{font-weight:700;font-size:16px}
+.meta{color:#999;font-size:12px;margin:2px 0 6px}
+.b{display:inline-block;font-size:12px;padding:3px 9px;border-radius:20px;background:#eee;color:#666}
+.b.on{background:#fbe9e7;color:#8c1c1c;font-weight:700}
+.row form{margin:0}
+.row button{border:0;border-radius:8px;padding:10px 14px;font-size:14px;font-weight:700;cursor:pointer;white-space:nowrap}
+button.pause{background:#8c1c1c;color:#fff}
+button.resume{background:#2c8b3a;color:#fff}
+.empty{color:#888;text-align:center;padding:40px 0}
+.note{color:#aaa;font-size:12px;text-align:center;margin:18px 0}</style>
+<header><h1>五 木 老 師 · 客服控制台</h1>
+<form method=post action="/admin/logout"><button>登出</button></form></header>
+<div class=wrap>
+<div class=count>共 __COUNT__ 位客戶 · 暫停後 2 小時自動恢復 AI</div>
+__BODY__
+<div class=note>暫停中的客戶，AI 不會自動回覆，請用 LINE 官方帳號後台手動處理。</div>
+</div>"""
+
+
+def render_admin_panel():
+    rows = []
+    ws = _get_worksheet("LINE好友清單")
+    if ws:
+        try:
+            data = ws.get_all_values()
+            for r in data[1:]:
+                uid = (r[0] if len(r) > 0 else '').strip()
+                if not uid:
+                    continue
+                name = (r[1] if len(r) > 1 else '').strip() or '(未命名)'
+                status = (r[4] if len(r) > 4 else '').strip()
+                rows.append((uid, name, status))
+        except Exception as e:
+            logger.error(f"控制台讀取客戶失敗: {e}")
+    now = datetime.now()
+    items = []
+    for uid, name, status in rows:
+        until = handoff_until.get(uid)
+        if until and until > now:
+            mins = int((until - now).total_seconds() // 60)
+            badge = f'<span class="b on">人工接手中 · 剩 {mins} 分</span>'
+            btn = '<button name=action value=resume class=resume>恢復 AI</button>'
+        else:
+            badge = '<span class="b">AI 自動回覆</span>'
+            btn = '<button name=action value=pause class=pause>暫停 2 小時</button>'
+        items.append(
+            '<div class=row><div><div class=name>' + _esc(name) + '</div>'
+            '<div class=meta>' + _esc(status) + ' · ' + _esc(uid[-8:]) + '</div>' + badge + '</div>'
+            '<form method=post action="/admin/toggle"><input type=hidden name=user_id value="' + _esc(uid) + '">' + btn + '</form></div>'
+        )
+    body = "".join(items) or '<p class=empty>目前沒有客戶資料。</p>'
+    return PANEL_HTML.replace("__COUNT__", str(len(rows))).replace("__BODY__", body)
+
+
+@app.route("/admin", methods=['GET'])
+def admin_home():
+    if not ADMIN_PASSWORD:
+        return Response("尚未設定 ADMIN_PASSWORD 環境變數，管理台未啟用。", mimetype="text/plain")
+    if not _admin_logged_in():
+        return Response(LOGIN_HTML.replace("__ERR__", ""), mimetype="text/html")
+    return Response(render_admin_panel(), mimetype="text/html")
+
+
+@app.route("/admin/login", methods=['POST'])
+def admin_login():
+    if ADMIN_PASSWORD and request.form.get('password') == ADMIN_PASSWORD:
+        session['admin'] = True
+        return redirect("/admin")
+    return Response(LOGIN_HTML.replace("__ERR__", '<div class=err>密碼錯誤</div>'), mimetype="text/html")
+
+
+@app.route("/admin/logout", methods=['POST'])
+def admin_logout():
+    session.clear()
+    return redirect("/admin")
+
+
+@app.route("/admin/toggle", methods=['POST'])
+def admin_toggle():
+    if not _admin_logged_in():
+        abort(403)
+    uid = request.form.get('user_id', '').strip()
+    action = request.form.get('action', '')
+    if uid:
+        set_handoff(uid, action == 'pause')
+        logger.info(f"🖥️ 控制台 {action} [{uid[:8]}...]")
+    return redirect("/admin")
+
+
+# ============================================================
 # 加好友事件：發送歡迎訊息
 # ============================================================
 @handler.add(FollowEvent)
@@ -1212,8 +1372,9 @@ def handle_message(event):
         cmd = user_message.strip()
         reply_text = None
         if cmd.startswith("#接手中"):
-            if manual_takeover:
-                reply_text = "目前人工接手中：\n" + "\n".join(f"・{u[-8:]}" for u in manual_takeover)
+            active = [u for u in list(handoff_until) if is_paused(u)]
+            if active:
+                reply_text = "目前人工接手中：\n" + "\n".join(f"・{u[-8:]}" for u in active)
             else:
                 reply_text = "目前沒有人工接手中的客戶。"
         elif cmd.startswith("#接手"):
@@ -1241,7 +1402,7 @@ def handle_message(event):
             return
 
     # 人工接手中的客戶：AI 完全不回，交給老師用 LINE 官方帳號後台手動處理
-    if user_id in manual_takeover:
+    if is_paused(user_id):
         logger.info(f"🙋 人工接手中，AI 略過 [{user_id[:8]}...]")
         return
 
