@@ -146,6 +146,39 @@ def update_lead_status(user_id: str, status: str, note: str = ""):
         logger.error(f"GSheet 狀態更新失敗: {e}")
 
 
+# 欄位 J（第 10 欄）= 遊戲狀態（Q1/Q2/Q3）；由 Make.com WF-2 主動發送測驗時寫入
+GAME_STATE_COL = 10
+
+def get_game_state(user_id: str) -> str:
+    """讀取用戶目前的心理測驗遊戲狀態（Q1/Q2/Q3）；無或失敗回空字串。"""
+    ws = _get_worksheet("LINE好友清單")
+    if not ws:
+        return ""
+    try:
+        cell = ws.find(user_id, in_column=1)
+        if not cell:
+            return ""
+        val = ws.cell(cell.row, GAME_STATE_COL).value
+        return (val or "").strip()
+    except Exception as e:
+        logger.error(f"讀取遊戲狀態失敗: {e}")
+        return ""
+
+
+def clear_game_state(user_id: str):
+    """答完一題後清除用戶測驗遊戲狀態（避免重複觸發）。"""
+    ws = _get_worksheet("LINE好友清單")
+    if not ws:
+        return
+    try:
+        cell = ws.find(user_id, in_column=1)
+        if cell:
+            ws.update_cell(cell.row, GAME_STATE_COL, "")
+            logger.info(f"🎮 已清除遊戲狀態: {user_id[:8]}...")
+    except Exception as e:
+        logger.error(f"清除遊戲狀態失敗: {e}")
+
+
 # ============================================================
 # B：對話情報落地（學習迴圈 Layer 1）
 # ============================================================
@@ -873,6 +906,96 @@ QUIZ_READINGS = {
 }
 
 
+# ============================================================
+# 心理測驗小遊戲（D+3 / D+7 / D+14 主動發送觸發，見『心理測驗小遊戲_v1.md』）
+# 只有 Google Sheet『LINE好友清單』J 欄=遊戲狀態(Q1/Q2/Q3) 的用戶回 A/B/C/D 才判讀
+# ============================================================
+_GAME_D14_TAIL = (
+    "\n\n不管你今年想主動出擊、還是先穩住等時機，小林都放在心上。\n"
+    "以後想聊命理、風水，或想看看自己的流年，隨時回我一聲就好，"
+    "五木老師這邊一直都在。祝你這段路走得安穩。"
+)
+
+GAME_READINGS = {
+    # 測驗 1（D+3）本命能量
+    "Q1": {
+        "A": (
+            "你是火型能量。天生行動力強、想到就想做，站在人群裡會發光。\n"
+            "五木老師常說，火旺的人不缺衝勁，缺的是「收」的時機——\n"
+            "懂得在對的時候停一下，火才會旺得久，而不是燒完就累。\n"
+            "如果你好奇自己今年火勢往哪走，可以跟我說，我幫你問老師。"
+        ),
+        "B": (
+            "你是木型能量。重成長、愛規劃，做事有條理，是會慢慢往上長的類型。\n"
+            "老師說木型的人最穩，但有時候太求穩、錯過該出手的點。\n"
+            "今年哪幾個月適合你放膽往前，其實命盤看得出來。想了解隨時找小林。"
+        ),
+        "C": (
+            "你是水型能量。直覺敏銳、心思細，很能感受別人沒說出口的東西。\n"
+            "老師說水型的人靈氣足，最怕的是想太多、把自己困住。\n"
+            "若你最近正卡在某個放不下的關口，可以跟我說，看看老師怎麼解。"
+        ),
+        "D": (
+            "你是土型能量。務實、重安全感，是身邊人最信得過的那一個。\n"
+            "老師說土型的人底盤穩，缺的常常是一個「敢突破」的契機。\n"
+            "今年有沒有適合你踏出去的時機點，命盤會告訴你。想看的回我一聲。"
+        ),
+    },
+    # 測驗 2（D+7）今年最該補的運（結果帶流年速覽報告 CTA）
+    "Q2": {
+        "A": (
+            "你直覺選了「財」。今年你心裡最在意的，其實是「守得住、理得順」。\n"
+            "五木老師說，財運好不好，一半看天給的流年，一半看你有沒有踩到破財的位置——\n"
+            "家裡財位、辦公桌方向，都會影響。想看你今年財的完整節奏，"
+            "五木老師的流年速覽報告（NT$499）會幫你整理好，回我「報告」就行。"
+        ),
+        "B": (
+            "你選了「緣」。今年對你來說，關係是關鍵字——不管是感情，還是合作的人。\n"
+            "老師說，緣分不是等來的，是走對位置、遇對時機。\n"
+            "你今年桃花與貴人往哪個方向走，命盤看得到。想要完整版，回我「報告」，"
+            "我把流年速覽報告（NT$499）的說明傳給你。"
+        ),
+        "C": (
+            "你選了「貴」。今年很適合你主動一點，去拓展、去求助，貴人就在動起來的路上。\n"
+            "老師說貴人運強的年份若只守著不動，等於把好牌放著不打。\n"
+            "哪幾個月是你的貴人檔期，五木老師的流年速覽報告（NT$499）會標出來，回我「報告」就幫你看。"
+        ),
+        "D": (
+            "你選了「安」。你最近可能有點累，身體或心裡想先把自己穩住。\n"
+            "老師說，先安人再談運——睡不好、心浮，很多時候跟臥室的格局有關。\n"
+            "如果你想先把今年的節奏看清楚再調整，回我「報告」，流年速覽報告（NT$499）會整理給你。"
+        ),
+    },
+    # 測驗 3（D+14）決策風格（結果帶溫暖收尾，取代原「最後一次主動」）
+    "Q3": {
+        "A": (
+            "你是行動派，看準了就走，這是很多人羨慕的果斷。\n"
+            "五木老師常說，命盤像地圖——行動派最大的優勢是敢出發，\n"
+            "要留意的是「別在逆風的流年衝太快」。你今年是順風還是逆風，命盤看得出來。"
+            + _GAME_D14_TAIL
+        ),
+        "B": (
+            "你是平衡派，重過程也重風景，穩中求進，不容易走偏。\n"
+            "老師說這種人走得久，但偶爾會因為想面面俱到而錯過時機。\n"
+            "哪個月適合你收、哪個月適合你放，其實可以先看清楚。"
+            + _GAME_D14_TAIL
+        ),
+        "C": (
+            "你是開創派，敢走別人沒走過的路，格局往往也開在這裡。\n"
+            "老師說開創的人最需要的是「貴人」與「時機」這兩張牌。\n"
+            "你今年的開創檔期落在哪，命盤會告訴你。"
+            + _GAME_D14_TAIL
+        ),
+        "D": (
+            "你是謀定派，善於等時機、不打沒把握的仗，這是難得的定力。\n"
+            "老師提醒謀定派一件事：別因為太會等，錯過了該出手的那個彎。\n"
+            "你命盤裡今年的「出手點」在哪，我可以幫你問老師。"
+            + _GAME_D14_TAIL
+        ),
+    },
+}
+
+
 def build_quiz_quick_reply():
     """測驗選數字用的快速回覆按鈕。"""
     return QuickReply(items=[
@@ -1015,6 +1138,28 @@ def handle_message(event):
                 )
             )
         return
+
+    # 心理測驗判讀（遊戲模式）：只有被主動發送測驗、Sheet J 欄=Qx 的用戶才觸發
+    # 僅在訊息剛好是單一字母 A/B/C/D 時查 Sheet，不增加一般對話延遲
+    game_ans = user_message.strip().rstrip("！!。.、，, ").upper()
+    game_ans = game_ans.translate(str.maketrans("ＡＢＣＤ", "ABCD"))
+    if game_ans in ("A", "B", "C", "D"):
+        game_state = get_game_state(user_id)
+        if game_state in GAME_READINGS:
+            reply_text = GAME_READINGS[game_state][game_ans]
+            append_to_history(user_id, "user", user_message)
+            append_to_history(user_id, "assistant", reply_text)
+            threading.Thread(target=clear_game_state, args=(user_id,), daemon=True).start()
+            logger.info(f"🎮 測驗 {game_state}-{game_ans} [{user_id[:8]}...]")
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text, quick_reply=build_quick_reply())]
+                    )
+                )
+            return
 
     # 1. 取得這位客戶的對話記憶(會自動清理過期內容)
     get_user_history(user_id)
