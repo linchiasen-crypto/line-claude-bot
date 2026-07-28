@@ -52,6 +52,15 @@ PAYMENT_INFO = os.environ.get('PAYMENT_INFO', '匯款資訊請洽老師本人安
 
 IG_PAGE_ACCESS_TOKEN = os.environ.get('IG_PAGE_ACCESS_TOKEN')
 
+# LINE 原始 access token（loading「輸入中」動畫 API 用）
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
+
+# 人工接手：老師個人 LINE userId（逗號分隔）可下指令暫停/恢復對某客戶的 AI 自動回覆
+ADMIN_USER_IDS = {u.strip() for u in os.environ.get('ADMIN_USER_IDS', '').split(',') if u.strip()}
+HANDOFF_COL = 11            # Google Sheet K 欄 = 人工接手（是/空）
+manual_takeover = set()     # 目前由真人接手、AI 暫停的 user_id
+_handoffs_loaded = False    # 是否已從 Sheet 載入接手名單
+
 # ============================================================
 # Google Sheet 設定（WF-1 入庫 + 對話情報落地）
 # ============================================================
@@ -177,6 +186,71 @@ def clear_game_state(user_id: str):
             logger.info(f"🎮 已清除遊戲狀態: {user_id[:8]}...")
     except Exception as e:
         logger.error(f"清除遊戲狀態失敗: {e}")
+
+
+# ------------------------------------------------------------
+# 人工接手（Human Handoff）：K 欄旗標讀寫 + 客戶解析
+# ------------------------------------------------------------
+def load_handoffs():
+    """從 Sheet K 欄載入目前『人工接手中』的 user_id（首次訊息時跑一次）。"""
+    global _handoffs_loaded
+    _handoffs_loaded = True
+    ws = _get_worksheet("LINE好友清單")
+    if not ws:
+        return
+    try:
+        flags = ws.col_values(HANDOFF_COL)   # 含標題列
+        ids = ws.col_values(1)
+        for i, v in enumerate(flags):
+            if i == 0:
+                continue
+            if str(v).strip() == "是" and i < len(ids) and str(ids[i]).strip():
+                manual_takeover.add(str(ids[i]).strip())
+        logger.info(f"🙋 載入人工接手名單 {len(manual_takeover)} 人")
+    except Exception as e:
+        logger.error(f"載入接手名單失敗: {e}")
+
+
+def set_handoff(user_id: str, on: bool):
+    """設定/解除某客戶的人工接手旗標（in-memory + Sheet K 欄）。"""
+    if on:
+        manual_takeover.add(user_id)
+    else:
+        manual_takeover.discard(user_id)
+    ws = _get_worksheet("LINE好友清單")
+    if not ws:
+        return
+    try:
+        cell = ws.find(user_id, in_column=1)
+        if cell:
+            ws.update_cell(cell.row, HANDOFF_COL, "是" if on else "")
+    except Exception as e:
+        logger.error(f"接手旗標寫入失敗: {e}")
+
+
+def resolve_customer(token: str):
+    """把老師輸入的 token 解析成 user_id：完整 UserID / UserID 末碼 / 姓名。找不到回 None。"""
+    token = (token or "").strip()
+    if not token:
+        return None
+    ws = _get_worksheet("LINE好友清單")
+    if not ws:
+        return token if token.startswith("U") else None
+    try:
+        ids = ws.col_values(1)
+        names = ws.col_values(2)
+        for uid in ids[1:]:
+            uid = str(uid).strip()
+            if uid and (uid == token or uid.endswith(token)):
+                return uid
+        for i, nm in enumerate(names):
+            if i == 0:
+                continue
+            if str(nm).strip() == token and i < len(ids):
+                return str(ids[i]).strip()
+    except Exception as e:
+        logger.error(f"客戶解析失敗: {e}")
+    return None
 
 
 # ============================================================
@@ -1031,6 +1105,43 @@ def build_welcome_message():
 
 
 # ============================================================
+# 真人感回覆：輸入中動畫 + 依長度停頓（模擬打字）
+# ============================================================
+def show_loading_animation(user_id, seconds=5):
+    """顯示 LINE『輸入中』動畫（1:1 聊天）。失敗不影響主流程。"""
+    if not LINE_CHANNEL_ACCESS_TOKEN or not user_id or user_id == "anonymous":
+        return
+    try:
+        requests.post(
+            "https://api.line.me/v2/bot/chat/loading/start",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+                     "Content-Type": "application/json"},
+            json={"chatId": user_id, "loadingSeconds": seconds},
+            timeout=5,
+        )
+    except Exception as e:
+        logger.warning(f"loading 動畫失敗: {e}")
+
+
+def typing_delay(text):
+    """依回覆長度模擬打字停頓：0.8s 起、每字加一點、上限 4.5s（避免 reply token 過期）。"""
+    return min(0.8 + len(text) / 28.0, 4.5)
+
+
+def human_reply(reply_token, user_id, text, quick_reply=None, thinking=0.0):
+    """模擬真人：輸入中動畫→依長度停頓（扣掉已花的思考時間）→回覆。"""
+    show_loading_animation(user_id)
+    time.sleep(max(typing_delay(text) - thinking, 0.4))
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message_with_http_info(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=text, quick_reply=quick_reply)],
+            )
+        )
+
+
+# ============================================================
 # Flask 路由
 # ============================================================
 @app.route("/", methods=['GET'])
@@ -1092,20 +1203,55 @@ def handle_message(event):
 
     logger.info(f"📩 收到 [{user_id[:8]}...]: {user_message}")
 
+    # 首次訊息時載入人工接手名單（服務重啟後恢復暫停狀態）
+    if not _handoffs_loaded:
+        load_handoffs()
+
+    # 老師管理指令（只有 ADMIN_USER_IDS 能用）：#接手 / #放手 / #接手中
+    if user_id in ADMIN_USER_IDS and user_message.strip().startswith("#"):
+        cmd = user_message.strip()
+        reply_text = None
+        if cmd.startswith("#接手中"):
+            if manual_takeover:
+                reply_text = "目前人工接手中：\n" + "\n".join(f"・{u[-8:]}" for u in manual_takeover)
+            else:
+                reply_text = "目前沒有人工接手中的客戶。"
+        elif cmd.startswith("#接手"):
+            token = cmd[len("#接手"):].strip()
+            target = resolve_customer(token)
+            if target:
+                set_handoff(target, True)
+                reply_text = f"已接手 {target[-8:]}，AI 已暫停自動回覆。處理完傳「#放手 {target[-8:]}」恢復。"
+            else:
+                reply_text = f"找不到客戶「{token}」。可用完整 UserID、末碼或姓名。"
+        elif cmd.startswith("#放手"):
+            token = cmd[len("#放手"):].strip()
+            target = resolve_customer(token)
+            if target:
+                set_handoff(target, False)
+                reply_text = f"已放手 {target[-8:]}，AI 恢復自動回覆。"
+            else:
+                reply_text = f"找不到客戶「{token}」。"
+        if reply_text is not None:
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token,
+                                        messages=[TextMessage(text=reply_text)])
+                )
+            return
+
+    # 人工接手中的客戶：AI 完全不回，交給老師用 LINE 官方帳號後台手動處理
+    if user_id in manual_takeover:
+        logger.info(f"🙋 人工接手中，AI 略過 [{user_id[:8]}...]")
+        return
+
     # Quick Reply 攔截：按鈕觸發的訊息直接回覆預設引導語，不呼叫 Claude
     if user_message in QUICK_REPLY_RESPONSES:
         reply_text = random.choice(QUICK_REPLY_RESPONSES[user_message])
         append_to_history(user_id, "user", user_message)
         append_to_history(user_id, "assistant", reply_text)
         logger.info(f"💬 Quick Reply [{user_id[:8]}...]: {user_message}")
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text, quick_reply=build_quick_reply())]
-                )
-            )
+        human_reply(event.reply_token, user_id, reply_text, build_quick_reply())
         return
 
     # 測驗攔截：60 秒易經財運小測（確定性流程，不經 AI）
@@ -1114,14 +1260,7 @@ def handle_message(event):
         append_to_history(user_id, "user", user_message)
         append_to_history(user_id, "assistant", QUIZ_INTRO)
         logger.info(f"🎲 測驗開始 [{user_id[:8]}...]")
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=QUIZ_INTRO, quick_reply=build_quiz_quick_reply())]
-                )
-            )
+        human_reply(event.reply_token, user_id, QUIZ_INTRO, build_quiz_quick_reply())
         return
 
     if quiz_key in QUIZ_READINGS:
@@ -1129,14 +1268,7 @@ def handle_message(event):
         append_to_history(user_id, "user", user_message)
         append_to_history(user_id, "assistant", reply_text)
         logger.info(f"🎲 測驗結果 {quiz_key} [{user_id[:8]}...]")
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text, quick_reply=build_quick_reply())]
-                )
-            )
+        human_reply(event.reply_token, user_id, reply_text, build_quick_reply())
         return
 
     # 心理測驗判讀（遊戲模式）：只有被主動發送測驗、Sheet J 欄=Qx 的用戶才觸發
@@ -1151,14 +1283,7 @@ def handle_message(event):
             append_to_history(user_id, "assistant", reply_text)
             threading.Thread(target=clear_game_state, args=(user_id,), daemon=True).start()
             logger.info(f"🎮 測驗 {game_state}-{game_ans} [{user_id[:8]}...]")
-            with ApiClient(configuration) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=reply_text, quick_reply=build_quick_reply())]
-                    )
-                )
+            human_reply(event.reply_token, user_id, reply_text, build_quick_reply())
             return
 
     # 1. 取得這位客戶的對話記憶(會自動清理過期內容)
@@ -1173,7 +1298,9 @@ def handle_message(event):
         for m in conversation_memory[user_id]
     ]
 
-    # 4. 呼叫 Claude API 生成回覆
+    # 4. 呼叫 Claude API 生成回覆（先開輸入中動畫，思考期間就有「打字」感）
+    show_loading_animation(user_id)
+    _t0 = time.time()
     try:
         response = claude_client.messages.create(
             model="claude-haiku-4-5",
@@ -1185,6 +1312,7 @@ def handle_message(event):
     except Exception as e:
         reply_text = "抱歉,系統暫時有點忙,請稍等一下或留下您的稱呼,老師會親自回覆您 🙏"
         logger.error(f"Claude API 錯誤: {e}")
+    _elapsed = time.time() - _t0
 
     # 5. AI 的回覆也存進記憶,這樣下一輪對話才會有上下文
     append_to_history(user_id, "assistant", reply_text)
@@ -1209,15 +1337,8 @@ def handle_message(event):
 
     logger.info(f"💬 回覆 [{user_id[:8]}...]: {reply_text[:60]}...")
 
-    # 8. 透過 LINE Messaging API 回覆給客戶
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message_with_http_info(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text, quick_reply=build_quick_reply())]
-            )
-        )
+    # 8. 模擬真人打字後回覆（扣掉 Claude 已花的思考時間，避免總延遲過長）
+    human_reply(event.reply_token, user_id, reply_text, build_quick_reply(), thinking=_elapsed)
 
 
 # ============================================================
