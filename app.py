@@ -115,6 +115,42 @@ def _get_worksheet(sheet_name: str):
         return None
 
 
+_name_cache = {}   # {user_id: LINE 顯示名稱}
+
+def get_line_display_name(user_id: str) -> str:
+    """用 LINE Profile API 取得客戶 LINE 顯示名稱；快取 + 失敗回空字串。"""
+    if not user_id or user_id == "anonymous":
+        return ""
+    if user_id in _name_cache:
+        return _name_cache[user_id]
+    name = ""
+    if LINE_CHANNEL_ACCESS_TOKEN:
+        try:
+            resp = requests.get(
+                f"https://api.line.me/v2/bot/profile/{user_id}",
+                headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+                timeout=5,
+            )
+            if resp.ok:
+                name = (resp.json().get("displayName") or "").strip()
+        except Exception as e:
+            logger.warning(f"取得 LINE 名稱失敗: {e}")
+    if name:
+        _name_cache[user_id] = name
+    return name
+
+
+def _backfill_name(rownum: int, name: str):
+    """把抓到的顯示名稱回填 Sheet B 欄（姓名），下次就不用再打 API。"""
+    ws = _get_worksheet("LINE好友清單")
+    if not ws:
+        return
+    try:
+        ws.update_cell(rownum, 2, name)
+    except Exception as e:
+        logger.error(f"名稱回填失敗: {e}")
+
+
 def log_new_follower(user_id: str, source: str = "LINE_OA"):
     """
     WF-1：新好友加入時寫入『LINE好友清單』工作表。
@@ -126,7 +162,7 @@ def log_new_follower(user_id: str, source: str = "LINE_OA"):
         return
     try:
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        row = [user_id, "", now, source, "新加入", "否", "否", "否", ""]
+        row = [user_id, get_line_display_name(user_id), now, source, "新加入", "否", "否", "否", ""]
         ws.append_row(row, value_input_option='USER_ENTERED')
         logger.info(f"✅ 新好友入庫: {user_id[:8]}...")
     except Exception as e:
@@ -1261,18 +1297,24 @@ def render_admin_panel():
     if ws:
         try:
             data = ws.get_all_values()
-            for r in data[1:]:
+            for idx, r in enumerate(data[1:], start=2):
                 uid = (r[0] if len(r) > 0 else '').strip()
                 if not uid:
                     continue
-                name = (r[1] if len(r) > 1 else '').strip() or '(未命名)'
+                name = (r[1] if len(r) > 1 else '').strip()
                 status = (r[4] if len(r) > 4 else '').strip()
-                rows.append((uid, name, status))
+                rows.append((idx, uid, name, status))
         except Exception as e:
             logger.error(f"控制台讀取客戶失敗: {e}")
     now = datetime.now()
     items = []
-    for uid, name, status in rows:
+    for rownum, uid, name, status in rows:
+        if not name:
+            fetched = get_line_display_name(uid)
+            if fetched:
+                name = fetched
+                threading.Thread(target=_backfill_name, args=(rownum, fetched), daemon=True).start()
+        name = name or ('客戶 ' + uid[-6:])
         until = handoff_until.get(uid)
         if until and until > now:
             mins = int((until - now).total_seconds() // 60)
