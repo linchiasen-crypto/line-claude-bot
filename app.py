@@ -1139,6 +1139,161 @@ GAME_READINGS = {
 }
 
 
+# ============================================================
+# 易經抽牌小測（主動發送觸發，見『易經抽牌小測_導占卜_v1.md』）
+# 只有 Sheet J 欄=抽牌狀態(D1/D2/D3) 的用戶回 1/2/3/4 才判讀；導向 L1 易經占卜
+# 狀態碼與心理測驗(Q1-3 回 A/B/C/D)、財運小測(3 位數字)三者不衝突
+# ============================================================
+_DRAW_TAIL = (
+    "\n\n—\n"
+    "易經占卜為單題快速指引（NT$1,000/題），僅供文化研究與生活參考，"
+    "不構成醫療、投資、法律等決策依據。"
+)
+
+DRAW_READINGS = {
+    # 測驗 A（D1）你現在卡住的那一關
+    "D1": {
+        "1": (
+            "你抽到的是「霧裡的一條路」→ 蒙卦（山水蒙）\n\n"
+            "這是「還沒看清」的狀態。方向感被霧擋著，不是你不行，是資訊還不夠。\n"
+            "五木老師說，這種時候最忌硬闖，先把「到底在問什麼」問清楚，霧自己會散一半。\n"
+            "蒙卦講的正是「不懂就問」——問對了，路才顯出來。\n\n"
+            "你心裡那個具體的問題，其實可以就它單獨起一卦來看。想試的話回我「占卜」。"
+            + _DRAW_TAIL
+        ),
+        "2": (
+            "你抽到的是「一扇緊閉的門」→ 需卦（水天需）\n\n"
+            "這是「時機未到」。門不是打不開，是現在還沒到開的時候。\n"
+            "老師說，需卦的等待不是停滯，是蓄力——把該備的備好，門一鬆你就進得去。\n"
+            "難的是分辨「還要等多久、等的時候該做什麼」。\n\n"
+            "這種「什麼時候動」的問題，起一卦看你當下的時位最清楚，想看回我「占卜」。"
+            + _DRAW_TAIL
+        ),
+        "3": (
+            "你抽到的是「一口淤住的井」→ 井卦（水風井）\n\n"
+            "這是「有水、但通道淤了」。你的實力跟資源都在，卡的是動線沒疏通。\n"
+            "五木老師說，井卦提醒的是「修井」——理順關係、流程或環境，水自然湧上來。\n"
+            "到底淤在哪一段，往往不是自己看得最清楚。\n\n"
+            "如果想針對你這口井找出淤點，可以起一卦來對，回我「占卜」我幫你安排。"
+            + _DRAW_TAIL
+        ),
+        "4": (
+            "你抽到的是「一顆快裂開的種子」→ 夬卦（澤天夬）\n\n"
+            "這是「離突破只差一步」。該決斷的點到了，種子的殼正要裂開。\n"
+            "老師說夬卦最怕的是「明明可以了卻還在猶豫」，一猶豫就錯過那口氣。\n"
+            "但要不要現在破、往哪個方向破，得看你當下的勢。\n\n"
+            "想確認這一步該不該踏、往哪踏，起一卦最準，回我「占卜」。"
+            + _DRAW_TAIL
+        ),
+    },
+    # 測驗 B（D2）一段正在你心上的關係
+    "D2": {
+        "1": (
+            "你抽到的是「並肩生長的兩株樹」→ 漸卦（風山漸）\n\n"
+            "這是「慢慢長」的關係。它不轟烈，但根在往下扎，是會走長的那種。\n"
+            "五木老師說，漸卦最忌催——你越想快點確定，它越彆扭。\n"
+            "給它時間，也給自己時間。\n\n"
+            "如果你想看這段關係接下來的節奏往哪走，可以就它起一卦，回我「占卜」。"
+            + _DRAW_TAIL
+        ),
+        "2": (
+            "你抽到的是「背對背的兩面鏡」→ 睽卦（火澤睽）\n\n"
+            "這是「角度不同」。不是不合，是你們看同一件事的位置不一樣。\n"
+            "老師說睽卦的解法不是逼對方轉過來，是先看懂「差在哪一格」。\n"
+            "看懂了，很多僵局其實只是誤會。\n\n"
+            "想釐清你們卡在哪個角度、怎麼接回來，起一卦看得比較透，回我「占卜」。"
+            + _DRAW_TAIL
+        ),
+        "3": (
+            "你抽到的是「隔著霧的一次照面」→ 咸卦（澤山咸）\n\n"
+            "這是「有感應、但還沒說開」。彼此心裡是有的，只是隔著一層沒點破。\n"
+            "五木老師說，咸卦講的是真心的感通——不用算計，順著那份感覺走就對了。\n"
+            "難的是「要不要主動、什麼時候主動」。\n\n"
+            "這種時機問題，依你當下的能量起一卦最清楚，想看回我「占卜」。"
+            + _DRAW_TAIL
+        ),
+        "4": (
+            "你抽到的是「一座年久待修的橋」→ 蠱卦（山風蠱）\n\n"
+            "這是「有舊帳待整理」。橋還在，但積了些沒處理的東西，走起來卡卡的。\n"
+            "老師說蠱卦不是壞卦，是「該修的時候到了」——修好反而比以前穩。\n"
+            "只是先修哪一根樑、從哪頭下手，得看實際情形。\n\n"
+            "想找出這段關係該先理哪一塊，可以起一卦來對，回我「占卜」。"
+            + _DRAW_TAIL
+        ),
+    },
+    # 測驗 C（D3）一個你還沒決定的選擇
+    "D3": {
+        "1": (
+            "你抽到的是「原地站著，先觀察」→ 艮卦（艮為山）\n\n"
+            "這是「該止則止」。你現在的觀望不是拖延，是身體比腦子先知道「還不到動的時候」。\n"
+            "五木老師說，艮卦是懂得停的智慧——停在對的地方，比亂動更有力量。\n"
+            "只是「要停到什麼訊號出現才動」，這條線每個人不一樣。\n\n"
+            "想知道你這件事的「動點」在哪，可以起一卦來看，回我「占卜」。"
+            + _DRAW_TAIL
+        ),
+        "2": (
+            "你抽到的是「順著水流往下走」→ 隨卦（澤雷隨）\n\n"
+            "這是「順勢」。這件事適合跟著時機走，不必硬要自己開路。\n"
+            "老師說隨卦不是隨便，是「看懂勢往哪去、然後跟上」。\n"
+            "關鍵在分辨「這股勢是真的順、還是一時熱鬧」。\n\n"
+            "想確認你要跟的這股勢靠不靠得住，起一卦最實在，回我「占卜」。"
+            + _DRAW_TAIL
+        ),
+        "3": (
+            "你抽到的是「逆著水往上游」→ 蹇卦（水山蹇）\n\n"
+            "這是「目前逆風」。不是不能做，是硬頂的話耗損會很大。\n"
+            "五木老師說蹇卦的智慧是「遇阻繞路、找貴人」——換個走法，難關就沒那麼難。\n"
+            "往哪繞、找誰幫，往往就是差這一步的資訊。\n\n"
+            "想看你這條路怎麼繞最省力，可以就它起一卦，回我「占卜」。"
+            + _DRAW_TAIL
+        ),
+        "4": (
+            "你抽到的是「一把火，全部重來」→ 革卦（澤火革）\n\n"
+            "這是「到了該變的點」。心裡其實已經有答案，只是還沒敢真的翻篇。\n"
+            "老師說革卦講「時機對了，變則通」——但革也要挑時候，早了晚了都費力。\n"
+            "你這一把火，現在點是不是時候？\n\n"
+            "這種「該不該變、什麼時候變」的問題，正是易經占卜最擅長回答的，回我「占卜」我幫你安排。"
+            + _DRAW_TAIL
+        ),
+    },
+}
+
+
+# 「占卜」關鍵字：抽牌伏筆收束 → 導 L1 易經占卜（NT$1,000/題）
+DIVINATION_TRIGGERS = {
+    "占卜", "我要占卜", "我想占卜", "想占卜", "易經占卜", "起卦", "我要起卦",
+}
+
+DIVINATION_REPLY = (
+    "好的，這就是五木老師的易經占卜。\n\n"
+    "作法是：就你心裡那一件具體的事，老師依你當下的能量單獨起一卦、解給你聽——\n"
+    "單題快速指引，一題 NT$1,000，大約 10 到 15 分鐘。\n\n"
+    "你可以先把想問的那一件事，用一句話告訴我"
+    "（例如某個決定、某段關係、或某個卡住的狀況），\n"
+    "我幫你把問題整理好、安排老師的時間。\n\n"
+    "—\n"
+    "易經占卜為單題快速指引（NT$1,000/題），僅供文化研究與生活參考，"
+    "不構成醫療、投資、法律等決策依據。"
+)
+
+
+def build_divination_quick_reply():
+    """抽牌判讀後導占卜用的快速回覆按鈕。"""
+    return QuickReply(items=[
+        QuickReplyItem(action=MessageAction(label="我想深入占卜", text="占卜")),
+    ])
+
+
+def build_draw_quick_reply():
+    """抽牌選數字用的快速回覆按鈕（供主動發送開場題時附帶）。"""
+    return QuickReply(items=[
+        QuickReplyItem(action=MessageAction(label="1", text="1")),
+        QuickReplyItem(action=MessageAction(label="2", text="2")),
+        QuickReplyItem(action=MessageAction(label="3", text="3")),
+        QuickReplyItem(action=MessageAction(label="4", text="4")),
+    ])
+
+
 def build_quiz_quick_reply():
     """測驗選數字用的快速回覆按鈕。"""
     return QuickReply(items=[
@@ -1474,6 +1629,14 @@ def handle_message(event):
         human_reply(event.reply_token, user_id, reply_text, build_quick_reply())
         return
 
+    # 「占卜」關鍵字攔截：抽牌伏筆收束 → 導 L1 易經占卜（確定性流程，不經 AI）
+    if quiz_key in DIVINATION_TRIGGERS:
+        append_to_history(user_id, "user", user_message)
+        append_to_history(user_id, "assistant", DIVINATION_REPLY)
+        logger.info(f"🔮 占卜導引 [{user_id[:8]}...]")
+        human_reply(event.reply_token, user_id, DIVINATION_REPLY, build_quick_reply())
+        return
+
     # 心理測驗判讀（遊戲模式）：只有被主動發送測驗、Sheet J 欄=Qx 的用戶才觸發
     # 僅在訊息剛好是單一字母 A/B/C/D 時查 Sheet，不增加一般對話延遲
     game_ans = user_message.strip().rstrip("！!。.、，, ").upper()
@@ -1487,6 +1650,20 @@ def handle_message(event):
             threading.Thread(target=clear_game_state, args=(user_id,), daemon=True).start()
             logger.info(f"🎮 測驗 {game_state}-{game_ans} [{user_id[:8]}...]")
             human_reply(event.reply_token, user_id, reply_text, build_quick_reply())
+            return
+
+    # 易經抽牌判讀：只有被主動發送抽牌、Sheet J 欄=Dx 的用戶回 1/2/3/4 才觸發
+    draw_ans = user_message.strip().rstrip("！!。.、，, ")
+    draw_ans = draw_ans.translate(str.maketrans("１２３４", "1234"))
+    if draw_ans in ("1", "2", "3", "4"):
+        draw_state = get_game_state(user_id)
+        if draw_state in DRAW_READINGS:
+            reply_text = DRAW_READINGS[draw_state][draw_ans]
+            append_to_history(user_id, "user", user_message)
+            append_to_history(user_id, "assistant", reply_text)
+            threading.Thread(target=clear_game_state, args=(user_id,), daemon=True).start()
+            logger.info(f"🔮 抽牌 {draw_state}-{draw_ans} [{user_id[:8]}...]")
+            human_reply(event.reply_token, user_id, reply_text, build_divination_quick_reply())
             return
 
     # 1. 取得這位客戶的對話記憶(會自動清理過期內容)
