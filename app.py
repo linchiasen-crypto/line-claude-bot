@@ -20,6 +20,7 @@ from linebot.v3.messaging import (
     ApiClient,
     MessagingApi,
     ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage,
     QuickReply,
     QuickReplyItem,
@@ -482,6 +483,81 @@ def scan_repurchase_triggers():
 
 
 # ============================================================
+# D+5 易經抽牌小測：每日掃 LINE好友清單，加入滿 5 天者主動 push 抽牌開場題
+# → 寫 J 欄=D1（抽牌旗標）+ L 欄=已發日期；客戶回 1-4 由 handle_message 判讀
+# 設計稿：D:\五木老師\AI團隊\客戶服務部\易經抽牌小測_導占卜_v1.md
+# ============================================================
+DRAW_D5_STATE = "D1"        # D+5 固定發「卡關組」（測驗 A）
+DRAW_D5_FLAG_COL = 12       # L 欄 = D5抽牌已發（K 之後，不動 J=10/K=11 的固定欄號）
+
+DRAW_D5_OPENING = (
+    "最近如果心裡有件事一直繞不過去，小林這邊有個易經抽牌小測，幫你看看那道關的性質。\n\n"
+    "閉上眼睛想一下那件事，然後憑直覺抽一張牌：\n\n"
+    "1 霧裡的一條路\n"
+    "2 一扇緊閉的門\n"
+    "3 一口淤住的井\n"
+    "4 一顆快裂開的種子\n\n"
+    "回一個數字給我就好。"
+)
+
+
+def push_line_text(user_id: str, text: str) -> bool:
+    """主動推播一則純文字給指定用戶（LINE push）。成功回 True。"""
+    if not LINE_CHANNEL_ACCESS_TOKEN or not user_id:
+        return False
+    try:
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message_with_http_info(
+                PushMessageRequest(to=user_id, messages=[TextMessage(text=text)])
+            )
+        return True
+    except Exception as e:
+        logger.error(f"LINE push 失敗 {user_id[:8]}...: {e}")
+        return False
+
+
+def scan_draw_d5():
+    """掃 LINE好友清單：加入滿 5 天、未發過、非成交/封鎖、無進行中遊戲者 → 發抽牌開場題。"""
+    ws = _get_worksheet("LINE好友清單")
+    if not ws:
+        return
+    try:
+        rows = ws.get_all_values()
+    except Exception as e:
+        logger.error(f"D+5 抽牌讀取失敗: {e}")
+        return
+    today = datetime.now().date()
+    sent = 0
+    for idx, row in enumerate(rows[1:], start=2):   # 跳表頭，Sheet 列號從 2 起
+        try:
+            uid = (row[0] if len(row) > 0 else "").strip()
+            join_raw = (row[2] if len(row) > 2 else "").strip()
+            status = (row[4] if len(row) > 4 else "").strip()
+            game = (row[9] if len(row) > 9 else "").strip()       # J 欄 遊戲狀態
+            d5flag = (row[11] if len(row) > 11 else "").strip()   # L 欄 D5抽牌已發
+            if not uid or not join_raw:
+                continue
+            if d5flag:                       # 已發過，不重發
+                continue
+            if status in ("已成交", "已封鎖"):
+                continue
+            if game:                         # 有進行中的測驗/抽牌，不覆蓋旗標
+                continue
+            jd = _parse_date(join_raw.split()[0])
+            if not jd or (today - jd.date()).days != 5:
+                continue
+            if push_line_text(uid, DRAW_D5_OPENING):
+                ws.update_cell(idx, GAME_STATE_COL, DRAW_D5_STATE)                 # J=D1
+                ws.update_cell(idx, DRAW_D5_FLAG_COL, today.strftime('%Y-%m-%d'))  # L=日期
+                sent += 1
+                logger.info(f"🔮 D+5 抽牌已發 [{uid[:8]}...]")
+        except Exception as e:
+            logger.error(f"D+5 抽牌處理列 {idx} 失敗: {e}")
+    if sent:
+        logger.info(f"🔮 D+5 抽牌掃描完成，發送 {sent} 人")
+
+
+# ============================================================
 # 背景排程：B 對話情報（每 10 分）＋ WF-3 回購掃描（每日一次，09 時後）
 # ============================================================
 # ⚠️ 假設 Render 單一 worker；多 worker 會重複寄信。Render 需保持不休眠。
@@ -495,6 +571,7 @@ def background_worker():
             now = datetime.now()
             if _last_daily_run != now.date() and now.hour >= 9:
                 scan_repurchase_triggers()
+                scan_draw_d5()
                 _last_daily_run = now.date()
         except Exception as e:
             logger.error(f"背景排程錯誤: {e}")
@@ -1520,6 +1597,17 @@ def admin_toggle():
         set_handoff(uid, action == 'pause')
         logger.info(f"🖥️ 控制台 {action} [{uid[:8]}...]")
     return redirect("/admin")
+
+
+@app.route("/admin/run-draw-d5", methods=['GET'])
+def admin_run_draw_d5():
+    """手動觸發 D+5 抽牌掃描（測試用）。需先登入 /admin。"""
+    if not _admin_logged_in():
+        abort(403)
+    threading.Thread(target=scan_draw_d5, daemon=True).start()
+    logger.info("🖥️ 控制台手動觸發 D+5 抽牌掃描")
+    return Response("D+5 抽牌掃描已觸發，請看 Render logs 與測試手機。",
+                    mimetype="text/plain; charset=utf-8")
 
 
 # ============================================================
