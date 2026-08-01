@@ -544,7 +544,13 @@ def scan_draw_d5():
             if game:                         # 有進行中的測驗/抽牌，不覆蓋旗標
                 continue
             jd = _parse_date(join_raw.split()[0])
-            if not jd or (today - jd.date()).days != 5:
+            if not jd:
+                continue
+            gap = (today - jd.date()).days
+            # 加入滿 5 天、仍在 14 天培育窗內才發；L 旗標保證只發一次。
+            # 用區間(非剛好==5)：Render 免費方案可能休眠錯過某天的 09 時窗口，
+            # 用 >=5 可補發，不會讓「剛好第5天」的人被永久跳過。
+            if gap < 5 or gap > 14:
                 continue
             if push_line_text(uid, DRAW_D5_OPENING):
                 ws.update_cell(idx, GAME_STATE_COL, DRAW_D5_STATE)                 # J=D1
